@@ -40,6 +40,11 @@ show_help() {
     echo "  --help             Show this help message"
 }
 
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
 # Function to check if Tailscale is installed
 is_tailscale_installed() {
     if opkg list-installed | grep -q "^tailscale "; then
@@ -69,7 +74,7 @@ backup_config() {
 # Function to check dependencies
 check_dependencies() {
     for cmd in opkg uci sed grep; do
-        which $cmd >/dev/null 2>&1 || { log "Required command '$cmd' not found" >&2; exit 1; }
+        command_exists $cmd || { log "Required command '$cmd' not found" >&2; exit 1; }
     done
     log "All required dependencies are available"
 }
@@ -83,15 +88,38 @@ uninstall_tailscale() {
         return
     fi
 
+    # Stop the Tailscale service
+    log "Stopping Tailscale service..."
     /etc/init.d/tailscale stop
+
+    # Run Tailscale cleanup
+    if command_exists tailscaled; then
+        log "Running Tailscale cleanup..."
+        tailscaled --cleanup
+    else
+        log "Tailscaled not found, skipping cleanup..."
+    fi
+
+    # Remove the Tailscale package
+    log "Removing Tailscale package..."
     opkg remove tailscale
-    uci delete network.${INTERFACE_NAME}
-    uci delete firewall.${ZONE_NAME}
+
+    # Remove Tailscale configurations
+    log "Removing Tailscale configurations..."
+    uci -q delete network.${INTERFACE_NAME}
+    uci -q delete firewall.${ZONE_NAME}
     uci -q del_list firewall.${ZONE_NAME}.dest_zone='lan'
     uci -q del_list firewall.${ZONE_NAME}.dest_zone='wan'
     uci -q del_list firewall.${ZONE_NAME}.src_zone='lan'
     uci commit
+
+    # Remove Tailscale init script modifications
+    log "Removing Tailscale init script modifications..."
     sed -i "/procd_append_param command --tun ${INTERFACE_NAME}/d" /etc/init.d/tailscale
+
+    # Remove Tailscale state directory
+    log "Removing Tailscale state directory..."
+    rm -rf /var/lib/tailscale
 
     log "Tailscale has been uninstalled and configurations removed."
 }
@@ -112,6 +140,26 @@ update_tailscale() {
     /etc/init.d/tailscale restart
 
     log "Tailscale has been updated."
+}
+
+# Function to prompt user for input
+prompt_user() {
+    local prompt="$1"
+    local variable="$2"
+    local default="$3"
+
+    if [ -n "$default" ]; then
+        prompt="$prompt (default: $default)"
+    fi
+
+    printf "%s: " "$prompt"
+    read -r user_input
+
+    if [ -z "$user_input" ] && [ -n "$default" ]; then
+        user_input="$default"
+    fi
+
+    eval "$variable=\"$user_input\""
 }
 
 # Function to install Tailscale
@@ -162,15 +210,89 @@ install_tailscale() {
 
     log "Restarting Tailscale service..."
     /etc/init.d/tailscale restart
+}
 
-    log "Starting Tailscale..."
-    tailscale up --netfilter-mode=off
+# Function to configure Tailscale
+configure_tailscale() {
+    log "Configuring Tailscale..."
 
-    log "Tailscale has been installed and configured. Please complete the setup by running 'tailscale up' and following the authentication link."
+    prompt_user "Enter your Tailscale auth key" AUTH_KEY
+    prompt_user "Enter the routes to advertise (comma-separated, e.g., 10.0.0.0/24,192.168.1.0/24)" ROUTES
+    prompt_user "Do you want to set up this device as a subnet router? (yes/no)" SETUP_SUBNET_ROUTER "no"
+    prompt_user "Do you want to set up this device as an exit node? (yes/no)" SETUP_EXIT_NODE "no"
+
+    local cmd="tailscale up --authkey=${AUTH_KEY} --netfilter-mode=off"
+
+    if [ -n "$ROUTES" ]; then
+        cmd="${cmd} --advertise-routes=${ROUTES}"
+
+        if [ "$SETUP_SUBNET_ROUTER" = "yes" ]; then
+            cmd="${cmd} --accept-routes"
+        fi
+    fi
+
+    if [ "$SETUP_EXIT_NODE" = "yes" ]; then
+        cmd="${cmd} --advertise-exit-node"
+    fi
+
+    eval $cmd
+
+    log "Tailscale configuration completed."
+}
+
+# Function to set up exit node routing
+setup_exit_node_routing() {
+    if [ "$SETUP_EXIT_NODE" = "yes" ]; then
+        log "Setting up exit node routing..."
+
+        # Disable default packet forwarding
+        uci_set "firewall.@defaults[0].forward='REJECT'"
+
+        # Disable LAN to WAN forwarding
+        uci del_list firewall.@zone[0].dest_zone='wan'
+
+        uci commit
+
+        prompt_user "Enter the hostname of the exit node you want to use (leave blank to skip)" EXIT_NODE
+
+        local cmd="tailscale up"
+
+        if [ -n "$EXIT_NODE" ]; then
+            cmd="${cmd} --exit-node=${EXIT_NODE} --exit-node-allow-lan-access=true"
+        fi
+
+        eval $cmd
+
+        log "Exit node routing configured."
+    else
+        log "Not setting up as an exit node."
+    fi
+}
+
+# Function to optimize network settings for Tailscale performance
+optimize_network_settings() {
+    if [ -d "/etc/networkd-dispatcher" ]; then
+        log "Optimizing network settings for Tailscale performance..."
+
+        mkdir -p /etc/networkd-dispatcher/routable.d/pre-up.d
+        cat > /etc/networkd-dispatcher/routable.d/pre-up.d/ethtool-config-udp-gro << EOF
+#!/bin/sh
+
+ethtool --offload \$IFACE rx-checksum off
+ethtool --offload \$IFACE tx-checksum-ip-generic off
+ethtool --change \$IFACE tso off gro off
+EOF
+        chmod +x /etc/networkd-dispatcher/routable.d/pre-up.d/ethtool-config-udp-gro
+        systemctl restart networkd-dispatcher
+
+        log "Network settings optimized."
+    else
+        log "Network dispatcher not found. Skipping network settings optimization."
+    fi
 }
 
 # Main script execution starts here
-log "Starting Tailscale installation script..."
+log "Starting Tailscale installation and configuration script..."
 
 # Check for root privileges
 if [ "$(id -u)" -ne 0 ]; then
@@ -217,6 +339,9 @@ elif [ "$UPDATE" -eq 1 ]; then
     update_tailscale
 else
     install_tailscale
+    configure_tailscale
+    setup_exit_node_routing
+    optimize_network_settings
 fi
 
 log "Script execution completed."
